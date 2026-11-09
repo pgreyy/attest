@@ -1,0 +1,15 @@
+name: attest
+version: 0.1.0
+description: "Paper trading ledger for Hermes agents. Orders, balances and P&L live in a SQLite ledger the plugin owns; the agent gets its figures by calling get_portfolio and get_pnl instead of stating them. Phase 1: limit orders fill at the limit price, no live prices or fees yet."
+requires_hermes: ">=0.23.0"
+provides_tools:
+  - paper_order
+  - get_portfolio
+  - get_pnl
+provides_commands:
+  - attest
+config_schema:
+  starting_balance:
+    type: number
+    default: 10000
+    description: "Starting balance in USDT for a new paper account, and the default for /attest reset."
