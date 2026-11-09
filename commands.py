@@ -1,4 +1,8 @@
-"""/attest slash command for a human. Every path returns a string and never raises."""
+"""/attest slash command for a human. Every path returns a string and never raises.
+
+resume and reset live here and nowhere else: they are not tools, so the agent
+can't switch the kill switch back on or wipe the account.
+"""
 from __future__ import annotations
 
 import shlex
@@ -7,10 +11,29 @@ from .ledger import Rejected
 
 USAGE = (
     "Usage:\n"
-    "  /attest status           cash, positions and P&L from the ledger\n"
+    "  /attest status           cash, positions, P&L, risk limits and the kill switch\n"
+    "  /attest resume           clear a tripped daily loss kill switch (today's loss count\n"
+    "                           restarts from the next order)\n"
     "  /attest reset [amount]   wipe the paper account and start fresh\n"
     "                           (default: starting_balance from config, 10000 USDT)"
 )
+
+
+def _risk_lines(risk) -> list:
+    ks, today = risk["kill_switch"], risk["today"]
+    lines = [f"  limits:         max order {risk['max_order_notional']}, max daily loss {risk['max_daily_loss']}"]
+    if today.get("start_equity") is None:
+        lines.append(f"  today ({today['date']}): no order yet today, so no starting equity recorded")
+    else:
+        live = "" if today.get("pnl_is_live", True) else " (NOT live: stale marks)"
+        lines.append(f"  today ({today['date']}): P&L {today['pnl']} from {today['start_equity']}{live}, "
+                     f"{today['loss_limit_remaining']} left before the kill switch")
+    if ks["tripped"]:
+        lines.append(f"  KILL SWITCH TRIPPED at {ks.get('tripped_at')}: {ks.get('reason')}")
+        lines.append("    buys are blocked; sells still allowed. /attest resume to clear it.")
+    else:
+        lines.append("  kill switch:    off")
+    return lines
 
 
 def _status(ledger) -> str:
@@ -34,8 +57,9 @@ def _status(ledger) -> str:
         f"  unrealized P&L: {q['unrealized_pnl']}",
         f"  total P&L:      {q['total_pnl']} ({q['return_pct']}%)",
         f"  trades:         {q['trade_count']} ({q['buys']} buys, {q['sells']} sells)",
-        f"  {p['mark_note']}",
     ]
+    lines += _risk_lines(q["risk"])
+    lines.append(f"  {p['mark_note']}")
     return "\n".join(lines)
 
 
@@ -49,13 +73,20 @@ def make_handler(get_ledger, default_balance):
             sub = words[0].lower() if words else "status"
             if sub == "status":
                 return _status(get_ledger())
+            if sub == "resume":
+                out = get_ledger().resume()
+                if out["was_tripped"]:
+                    return (f"attest: kill switch cleared for {out['day']}. Today's loss count restarts from "
+                            "the next order's equity.")
+                return (f"attest: the kill switch was not tripped for {out['day']}; today's loss count restarts "
+                        "from the next order's equity.")
             if sub == "reset":
                 if len(words) > 2:
                     return USAGE
                 amount = words[1] if len(words) == 2 else default_balance()
                 out = get_ledger().reset(amount)
                 return (f"attest: paper account reset. Starting balance {out['starting_balance']} "
-                        f"{out['currency']}, no trades, no positions.")
+                        f"{out['currency']}, no trades, no positions, kill switch off.")
             return USAGE
         except Rejected as r:
             return f"attest: {r.reason}"

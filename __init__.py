@@ -4,8 +4,8 @@ The agent makes decisions; the plugin owns the money. Orders go through
 paper_order, and the agent learns its balance and P&L only by calling
 get_portfolio and get_pnl, which read straight from the ledger.
 
-Phase 2: orders are priced from live Binance quotes (prices.py) with
-slippage and fees. Risk controls (a real pre_tool_call) come in Phase 3.
+Orders are priced from live exchange quotes (prices.py: OKX, then Kraken,
+then Binance) with slippage and fees, after the risk checks in ledger.py.
 """
 import threading
 from decimal import Decimal
@@ -13,12 +13,15 @@ from pathlib import Path
 
 from . import commands, tools
 from .ledger import DEFAULT_POLICY, DEFAULT_STARTING_BALANCE, Ledger
-from .prices import BinanceSource
+from .prices import BinanceSource, FallbackSource, KrakenSource, OkxSource
 
 DB_NAME = "attest.db"
 
 # config key -> (lowest, highest) accepted; anything else falls back to the default
-_POLICY_LIMITS = {"fee_bps": (0, 1000), "slippage_bps": (0, 1000), "max_quote_age_seconds": (1, 300)}
+_POLICY_LIMITS = {"fee_bps": (0, 1000), "slippage_bps": (0, 1000), "max_quote_age_seconds": (1, 300),
+                  "max_order_notional": (Decimal("0.01"), Decimal("1e12")),
+                  "max_daily_loss": (Decimal("0.01"), Decimal("1e12")),
+                  "dedupe_window_seconds": (0, 3600)}
 
 _CTX = None
 _LEDGER = None
@@ -61,7 +64,9 @@ def get_ledger() -> Ledger:
         with _LOCK:
             if _LEDGER is None:
                 DB_PATH = _data_dir() / DB_NAME
-                _LEDGER = Ledger(DB_PATH, _starting_balance(), prices=BinanceSource(), policy=_policy)
+                feed = FallbackSource([OkxSource(), KrakenSource(), BinanceSource()],
+                                      max_age=lambda: float(_policy()["max_quote_age_seconds"]))
+                _LEDGER = Ledger(DB_PATH, _starting_balance(), prices=feed, policy=_policy)
     return _LEDGER
 
 
@@ -72,6 +77,6 @@ def register(ctx):
     ctx.register_command(
         "attest",
         commands.make_handler(get_ledger, _starting_balance),
-        description="attest: paper trading ledger status and reset",
-        args_hint="status | reset [amount]",
+        description="attest: paper trading ledger status, kill switch resume, reset",
+        args_hint="status | resume | reset [amount]",
     )

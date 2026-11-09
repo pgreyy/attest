@@ -1,17 +1,20 @@
 name: attest
-version: 0.2.0
-description: "Paper trading ledger for Hermes agents. Orders, balances and P&L live in a SQLite ledger the plugin owns; the agent gets its figures by calling get_portfolio and get_pnl instead of stating them. Orders are priced from live Binance quotes with slippage and a fee; no real money, no account, no key. Network: read-only HTTPS GET to data-api.binance.vision (public market data) when an order is placed or a position is marked. Nothing else leaves the machine."
+version: 0.3.0
+description: "Paper trading ledger for Hermes agents. Orders, balances and P&L live in a SQLite ledger the plugin owns; the agent gets its figures by calling get_portfolio, get_pnl and get_quote instead of stating them. Orders are priced from live public exchange quotes with slippage and a fee, and pass a per-order size limit, a daily loss kill switch and duplicate-order checks first. No real money, no exchange account, no keys. Network: read-only HTTPS GETs of public ticker data from www.okx.com, then api.kraken.com, then data-api.binance.vision as fallbacks. Nothing else leaves the machine."
 requires_hermes: ">=0.23.0"
-# Network disclosure (Hermes has no manifest field for this, so it is stated here and in the description):
-#   host:    data-api.binance.vision (Binance public market data, no key, no account)
-#   request: GET /api/v3/ticker/bookTicker?symbol=<PAIR>, 3 second timeout
-#   when:    on paper_order, and on get_portfolio, get_pnl and /attest status to mark open positions
-#   sends:   only the trading pair, for example BTCUSDT
+# Network disclosure (Hermes has no manifest field for this, so it is stated here and in the description).
+# Tried in this order; the next host is used only if the previous one fails, times out, or sends a bad or
+# stale quote. Each request has a hard 3 second deadline and sends only the trading pair.
+#   1. www.okx.com              GET /api/v5/market/ticker?instId=BTC-USDT
+#   2. api.kraken.com           GET /0/public/Ticker?pair=XBTUSDT
+#   3. data-api.binance.vision  GET /api/v3/ticker/bookTicker?symbol=BTCUSDT
+# When: on paper_order and get_quote, and on get_portfolio, get_pnl and /attest status to mark open positions.
 tags:
   - paper-trading
   - network
 provides_tools:
   - paper_order
+  - get_quote
   - get_portfolio
   - get_pnl
 provides_commands:
@@ -28,8 +31,20 @@ config_schema:
   slippage_bps:
     type: number
     default: 5
-    description: "Slippage against the trader in basis points (buys above the ask, sells below the bid). 0 to 1000."
+    description: "Slippage against the trader in basis points (buys above the ask, sells below the bid), never past a limit price. 0 to 1000."
   max_quote_age_seconds:
     type: number
     default: 10
     description: "A quote older than this is stale and is never used to fill or to mark as live. 1 to 300."
+  max_order_notional:
+    type: number
+    default: 1000
+    description: "Largest single order in USDT (quantity times the live ask for buys, bid for sells). Larger orders are rejected."
+  max_daily_loss:
+    type: number
+    default: 500
+    description: "Daily loss kill switch in USDT. Once equity at live marks falls this much below the day's starting equity (taken at the first order of the UTC day), buys are blocked until the next UTC day or /attest resume."
+  dedupe_window_seconds:
+    type: number
+    default: 10
+    description: "An identical order in the same session within this many seconds, without a new client_order_id, is rejected as a likely accidental repeat. 0 turns this off."
