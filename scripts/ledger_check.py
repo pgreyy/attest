@@ -18,8 +18,8 @@ from types import SimpleNamespace
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
-from ledger import Ledger, Rejected, normalize_symbol  # noqa: E402
-from prices import (BINANCE_SOURCE, KRAKEN_SOURCE, OKX_SOURCE, BinanceSource, FallbackSource,  # noqa: E402
+from ledger import SCHEMA_VERSION, Ledger, Rejected, normalize_symbol  # noqa: E402
+from prices import (BINANCE_SOURCE, KRAKEN_SOURCE, OKX_SOURCE, BinanceSource, DemoSource, FallbackSource,  # noqa: E402
                     KrakenSource, OkxSource, PriceError, Quote, kraken_pair, okx_inst_id, parse_binance,
                     parse_book_ticker, parse_kraken, parse_okx)
 
@@ -415,7 +415,7 @@ def marks(path, feed, clock):
     assert led.portfolio()["marks_live"] is True, "mark did not return to live"
 
 
-@case("migration: a Phase 1 database opens, gains the schema 2 and 3 columns, keeps its data")
+@case("migration: a Phase 1 database opens, gains every later column and table, keeps its data")
 def migration(path, feed, clock):
     con = sqlite3.connect(str(path))
     con.executescript("""
@@ -447,7 +447,14 @@ def migration(path, feed, clock):
     for col in ("quote_bid", "quote_ask", "quote_fetched_at", "price_source", "slippage_bps",
                 "quote_time", "session_id", "order_key", "ts_epoch", "result_json"):
         assert col in cols, f"missing column {col}"
-    assert version == "3", f"schema_version {version}"
+    assert version == str(SCHEMA_VERSION), f"schema_version {version}"
+    con = sqlite3.connect(str(path))
+    try:
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    finally:
+        con.close()
+    for table in ("risk_state", "risk_days", "attest_sessions"):
+        assert table in tables, f"missing table {table}"
     p, q = led.portfolio(), led.pnl()
     eq(p["cash"], "9400", "cash kept")
     eq(p["positions"][0]["quantity"], "0.01", "position kept")
@@ -804,7 +811,7 @@ class Boom:
         raise RuntimeError("simulated ledger failure")
 
 
-def plugin_instance(config, ledger):
+def plugin_instance(config, ledger, data_dir=None):
     """The real plugin package, freshly loaded and registered against a fake Hermes
     context, with its ledger replaced by one on a temp db with a fake feed."""
     import importlib.util
@@ -820,12 +827,14 @@ def plugin_instance(config, ledger):
         if config.get("_broken"):
             raise RuntimeError("config unreadable")
         return config.get(key, default)
-    ctx = SimpleNamespace(get_config=get_config, state=SimpleNamespace(data_dir=str(Path(tempfile.gettempdir()) / "unused")),
+    ctx = SimpleNamespace(get_config=get_config,
+                          state=SimpleNamespace(data_dir=str(data_dir or Path(tempfile.gettempdir()) / "unused")),
                           register_tool=lambda **kw: reg.tools.__setitem__(kw["name"], kw),
                           register_hook=lambda hook, cb, **kw: reg.hooks.__setitem__(hook, cb),
                           register_command=lambda cmd, h, **kw: reg.commands.__setitem__(cmd, h))
     pkg.register(ctx)
-    pkg._LEDGER = ledger
+    if ledger is not None:
+        pkg._LEDGER = ledger
     pkg.SETTINGS_TTL = 0  # see config edits at once
     if "demo_broker_order" in reg.tools:
         real = reg.tools["demo_broker_order"]["handler"]
@@ -863,7 +872,8 @@ def intercept_paper(path, feed, clock):
     assert msg.startswith(LABEL_START) and "Paper fill recorded" in msg, msg[:200]
     fill = _json.loads(msg.split(" Result: ", 1)[1])
     assert fill["ok"] and fill["trade"]["symbol"] == "BTCUSDT", fill
-    eq(fill["trade"]["price"], "60040.005", "intercepted order priced like paper_order")
+    assert fill["trade"]["price"] == "60040.01", f"display rounding: {fill['trade']['price']}"
+    eq(trade_row(path, fill["trade"]["id"])["price"], "60040.005", "ledger keeps the full-precision price")
     assert led.pnl()["trade_count"] == 1, "fill not on the ledger"
     blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 0.001,
                                                           "client_order_id": "x-1"})
@@ -955,11 +965,11 @@ def claim_flags(path, feed, clock):
     tr = lambda text, sid="sess-A": reg.hooks["transform_llm_output"](
         response_text=text, session_id=sid, model="m", platform="cli", turn_id="t")
     for text, note in (
-        ("Your equity is $10,500.", "attest check: the ledger shows equity 10020.00 USDT, not $10,500."),
+        ("Your equity is $10,500.", "attest check: the ledger shows equity 10,020.00 USDT, not $10,500."),
         ("Your total P&L is $50.", "attest check: the ledger shows total P&L 20.00 USDT, not $50."),
         ("That is a return of 1.5% so far.", "attest check: the ledger shows return 0.20%, not 1.5%."),
         ("Overall you have a loss of $20 on the account.", "attest check: the ledger shows total P&L 20.00 USDT, not -$20."),
-        ("Your balance is $9,000.", "attest check: the ledger shows cash 9710.00 USDT and equity 10020.00 USDT, not $9,000."),
+        ("Your balance is $9,000.", "attest check: the ledger shows cash 9,710.00 USDT and equity 10,020.00 USDT, not $9,000."),
     ):
         out = tr(text)
         assert isinstance(out, str) and out.startswith(text), f"original text changed: {out!r}"
@@ -968,7 +978,7 @@ def claim_flags(path, feed, clock):
                "- Realized P&L: $10\n- Unrealized P&L: +$10.00\n- Return: 0.2%\n- Balance: $10,020")
     assert tr(correct) is None, f"a correct reply was flagged: {tr(correct)!r}"
     out = tr("Your equity is $10,500. Your cash is $9,710.")
-    assert out.endswith("\n\nattest check: the ledger shows equity 10020.00 USDT, not $10,500."), out
+    assert out.endswith("\n\nattest check: the ledger shows equity 10,020.00 USDT, not $10,500."), out
 
 
 @case("claim check: ignores ungroundable figures and sessions that never called attest; fails open")
@@ -991,12 +1001,113 @@ def claim_quiet(path, feed, clock):
     try:
         assert tr("Your equity is $10,500.") is None, "flagged equity with stale marks"
         out = tr("Your cash is $5,000.")
-        assert out and out.endswith("cash 9710.00 USDT, not $5,000."), out
+        assert out and out.endswith("cash 9,710.00 USDT, not $5,000."), out
     finally:
         feed.down = False
     pkg._LEDGER = Boom()
     assert tr("Your equity is $10,500.") is None, "an internal error changed the reply"
     assert reg.hooks["transform_llm_output"](response_text=None, session_id="sess-A") is None, "None input"
+
+
+# ---------------------------------------------------------------- Phase 6 cases
+
+@case("claim check: a session that used attest is remembered across a gateway restart")
+def claim_after_restart(path, feed, clock):
+    led, pkg, reg = _claim_setup(path, feed, clock)  # session sess-A called get_pnl here
+    led2 = Ledger(path, D("10000"), prices=feed, policy=NO_COSTS, clock=clock)
+    pkg2, reg2 = plugin_instance({}, led2)  # a fresh plugin load: empty memory, like a restart
+    assert not pkg2._SESSIONS, "precondition: the new load starts with no sessions in memory"
+    out = reg2.hooks["transform_llm_output"](response_text="Your equity is 10,580 USDT.", session_id="sess-A",
+                                             model="m", platform="cli", turn_id="t")
+    assert out == "Your equity is 10,580 USDT.\n\nattest check: the ledger shows equity 10,020.00 USDT, not 10,580 USDT.", out
+    assert reg2.hooks["transform_llm_output"](response_text="Your equity is 10,580 USDT.", session_id="sess-new") is None
+
+
+@case("display: tool results rounded (USDT 2, qty 8), ledger exact, rounded figures never flagged")
+def display_rounding(path, feed, clock):
+    led = Ledger(path, D("10000"), prices=feed, policy=LIVE_COSTS, clock=clock)
+    pkg, reg = plugin_instance({}, led)
+    feed.set("BTCUSDT", 59990, 60010)
+    buy = _json.loads(reg.tools["paper_order"]["handler"]({"symbol": "BTC", "side": "buy", "quantity": 0.01},
+                                                          session_id="sess-D"))
+    t = buy["trade"]
+    assert (t["price"], t["quantity"], t["fee"], t["notional"]) == ("60040.01", "0.01000000", "0.60", "600.40"), t
+    assert buy["cash_after"] == "9399.00" and "full precision" in buy["display_note"], buy
+    assert trade_row(path, t["id"])["fee"] == "0.60040005", "the ledger must keep the exact fee"
+    feed.set("BTCUSDT", 61990, 62010)
+    reg.tools["paper_order"]["handler"]({"symbol": "BTC", "side": "sell", "quantity": 0.005}, session_id="sess-D")
+    p = _json.loads(reg.tools["get_portfolio"]["handler"]({}, session_id="sess-D"))
+    assert p["cash"] == "9708.48" and p["total_equity"] == "10018.43", p
+    assert p["positions"][0]["quantity"] == "0.00500000" and p["positions"][0]["avg_cost"] == "60100.05", p
+    eq(led.portfolio()["cash"], "9708.484779925", "ledger.portfolio() stays exact")
+    q = _json.loads(reg.tools["get_pnl"]["handler"]({}, session_id="sess-D"))
+    assert (q["realized_pnl"], q["unrealized_pnl"], q["total_pnl"], q["return_pct"]) == \
+        ("8.99", "9.45", "18.43", "0.18"), q
+    # The agent repeating the rounded figures must never be flagged.
+    text = ("Cash: 9,708.48 USDT\nEquity: 10,018.43 USDT\nRealized P&L: $8.99\nUnrealized P&L: $9.45\n"
+            "Total P&L: $18.43\nReturn: 0.18%")
+    assert reg.hooks["transform_llm_output"](response_text=text, session_id="sess-D") is None, "rounding flagged"
+    status = reg.commands["attest"]("status")
+    for want in ("cash:           9,708.48 USDT", "total equity:   10,018.43 USDT (started with 10,000.00)",
+                 "BTCUSDT: 0.00500000 @ avg 60,100.05", "total P&L:      18.43 USDT (0.18%)"):
+        assert want in status, f"status lacks {want!r}:\n{status}"
+
+
+@case("status: a tripped kill switch shows only the tripped line, no 'left before the kill switch'")
+def status_tripped(path, feed, clock):
+    led = Ledger(path, D("10000"), prices=feed, policy=KILL, clock=clock)
+    pkg, reg = plugin_instance({}, led)
+    feed.set("BTCUSDT", 60000, 60000)
+    assert led.place_order({"symbol": "BTC", "side": "buy", "quantity": 0.01})["ok"]
+    status = reg.commands["attest"]("status")
+    assert "left before the kill switch" in status and "kill switch:    off" in status, status
+    feed.set("BTCUSDT", 9000, 9000)
+    status = reg.commands["attest"]("status")
+    assert "KILL SWITCH TRIPPED" in status and "loss of 510.00" in status, status
+    assert "left before the kill switch" not in status and "kill switch:    off" not in status, status
+    assert "today (" not in status, status
+
+
+@case("demo_feed: stale rejects orders and marks stale; down rejects every source; status shows a loud line")
+def demo_feed(path, feed, clock):
+    market = Market(clock)
+    market.set("BTCUSDT", 59990, 60010)
+    mode = {"m": "off"}
+    stack = FallbackSource([DemoSource(src, lambda: mode["m"]) for src in market.stack().sources],
+                           max_age=10, clock=clock)
+    led = Ledger(path, D("10000"), prices=stack, policy=LIVE_COSTS, clock=clock)
+    assert led.place_order({"symbol": "BTC", "side": "buy", "quantity": 0.001, "client_order_id": "d1"})["ok"]
+    mode["m"] = "stale"
+    out = expect_reject(led, {"symbol": "BTC", "side": "buy", "quantity": 0.001, "client_order_id": "d2"},
+                        "stale_quote", "demo stale")
+    assert "DEMO FEED stale" in out["reason"] and "60.000 seconds old" in out["reason"], out["reason"]
+    p = led.portfolio()
+    assert p["marks_live"] is False and "STALE" in p["mark_note"], "stale demo feed shown as live"
+    q = led.get_quote("BTC")
+    assert q["ok"] is False and q["reason_code"] == "stale_quote", q
+    mode["m"] = "down"
+    requests_before = len(market.requests)
+    out = expect_reject(led, {"symbol": "BTC", "side": "buy", "quantity": 0.001, "client_order_id": "d3"},
+                        "feed_unavailable", "demo down")
+    for name in ("okx", "kraken", "binance"):
+        assert f"{name} is switched off by the demo_feed setting" in out["reason"], out["reason"]
+    assert len(market.requests) == requests_before, "demo down still sent requests"
+    mode["m"] = "off"
+    assert led.place_order({"symbol": "BTC", "side": "buy", "quantity": 0.001, "client_order_id": "d4"})["ok"]
+    # The real wiring: demo_feed in config wraps the real OKX/Kraken/Binance sources.
+    # Only "down" is used here, which never touches the network.
+    with tempfile.TemporaryDirectory(prefix="attest-demo-") as d:
+        cfg = {"demo_feed": "down"}
+        pkg, reg = plugin_instance(cfg, None, data_dir=d)
+        r = _json.loads(reg.tools["paper_order"]["handler"]({"symbol": "BTC", "side": "buy", "notional": 50},
+                                                            session_id="sess-demo"))
+        assert r["ok"] is False and r["reason_code"] == "feed_unavailable" and "DEMO FEED down" in r["reason"], r
+        status = reg.commands["attest"]("status")
+        assert "!!! DEMO FEED: DOWN" in status, status
+        cfg["demo_feed"] = "stale"
+        assert "!!! DEMO FEED: STALE" in reg.commands["attest"]("status"), "stale banner"
+        cfg["demo_feed"] = "off"
+        assert "DEMO FEED" not in reg.commands["attest"]("status"), "banner shown with demo_feed off"
 
 
 def main():
@@ -1025,6 +1136,10 @@ def main():
         ("intercept_others.db", (intercept_others,)),
         ("claims.db", (claim_flags,)),
         ("claims_quiet.db", (claim_quiet,)),
+        ("claims_restart.db", (claim_after_restart,)),
+        ("display.db", (display_rounding,)),
+        ("status_tripped.db", (status_tripped,)),
+        ("demo_feed.db", (demo_feed,)),
     )
     with tempfile.TemporaryDirectory(prefix="attest-check-") as tmp:
         assert ".hermes" not in tmp, "refusing to run against a Hermes folder"

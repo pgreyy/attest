@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal, InvalidOperation, localcontext
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CURRENCY = "USDT"
 DEFAULT_STARTING_BALANCE = Decimal("10000")
 DEFAULT_POLICY = {"fee_bps": 10, "slippage_bps": 5, "max_quote_age_seconds": 10,
@@ -108,6 +108,11 @@ CREATE TABLE IF NOT EXISTS risk_days (
     day          TEXT PRIMARY KEY,
     start_equity TEXT NOT NULL,
     created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attest_sessions (
+    session_id TEXT PRIMARY KEY,
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL
 );
 """
 
@@ -172,6 +177,12 @@ def fmt(d: Decimal) -> str:
         d = d.quantize(Decimal("1e-12"))
     s = format(d.normalize(), "f")
     return "0" if s in ("-0", "0") else s
+
+
+def money(d: Decimal) -> str:
+    """A USDT amount for a message: 2 decimals. Display only; the ledger keeps full precision."""
+    q = Decimal(d).quantize(Decimal("0.01"))
+    return f"{abs(q) if q == 0 else q:.2f}"
 
 
 def normalize_symbol(raw) -> str:
@@ -463,9 +474,9 @@ class Ledger:
                 start = Decimal(day["start_equity"])
                 loss = start - equity
                 if loss >= pol["max_daily_loss"]:
-                    reason = (f"equity fell from {fmt(start)} to {fmt(equity)} {CURRENCY} today, a loss of "
-                              f"{fmt(loss)}, which reached the {fmt(pol['max_daily_loss'])} {CURRENCY} daily "
-                              "loss limit.")
+                    reason = (f"equity fell from {money(start)} to {money(equity)} {CURRENCY} today, a loss "
+                              f"of {money(loss)}, which reached the {money(pol['max_daily_loss'])} {CURRENCY} "
+                              "daily loss limit.")
                     con.execute("UPDATE risk_state SET tripped = 1, tripped_day = ?, tripped_at = ?, reason = ? "
                                 "WHERE id = 1", (today, self._iso(), reason))
         return self._risk_view(equity, marks_live, pol)
@@ -503,8 +514,8 @@ class Ledger:
 
     def _too_large(self, value: Decimal, pol) -> Rejected:
         return Rejected("order_too_large",
-                        f"order size {fmt(value.quantize(Decimal('0.01')))} {CURRENCY} is above the per-order "
-                        f"limit of {fmt(pol['max_order_notional'])} {CURRENCY}. Place a smaller order.",
+                        f"order size {money(value)} {CURRENCY} is above the per-order "
+                        f"limit of {money(pol['max_order_notional'])} {CURRENCY}. Place a smaller order.",
                         order_value=fmt(value), max_order_notional=fmt(pol["max_order_notional"]))
 
     # fill ----------------------------------------------------------------
@@ -598,7 +609,7 @@ class Ledger:
             cost = notional + fee
             if cost > cash:
                 raise Rejected("insufficient_cash",
-                               f"buy needs {fmt(cost)} {CURRENCY} including fee but only {fmt(cash)} "
+                               f"buy needs {money(cost)} {CURRENCY} including fee but only {money(cash)} "
                                f"{CURRENCY} is available.", needed=fmt(cost), available=fmt(cash), quote=quote)
             cash -= cost
             held += qty
@@ -751,6 +762,25 @@ class Ledger:
                 "reconciles": total == equity - s["start"],
                 "marks_live": s["marks_live"], "mark_note": s["mark_note"], "risk": risk,
             }
+
+    # -- sessions that used attest (for the claim check; survives restarts) --
+
+    def note_session(self, session_id) -> None:
+        if not session_id:
+            return
+        now = self._now()
+        with self._connect() as con:
+            con.execute("INSERT INTO attest_sessions (session_id, first_seen, last_seen) VALUES (?, ?, ?) "
+                        "ON CONFLICT(session_id) DO UPDATE SET last_seen = excluded.last_seen",
+                        (str(session_id), now, now))
+            con.execute("DELETE FROM attest_sessions WHERE last_seen < ?", (now - 90 * 86400,))
+
+    def session_used(self, session_id) -> bool:
+        if not session_id:
+            return False
+        with self._connect() as con:
+            return con.execute("SELECT 1 FROM attest_sessions WHERE session_id = ?",
+                               (str(session_id),)).fetchone() is not None
 
     def figures(self) -> dict:
         """The headline figures as Decimals, read-only (no risk writes), for the claim check."""

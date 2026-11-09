@@ -133,9 +133,12 @@ def _close(stated: Decimal, real: Decimal, field: str, signed: bool) -> bool:
 
 
 def _show(field: str, value: Decimal) -> str:
+    """Display only: 2 decimals with thousands separators. Comparison uses full precision."""
+    q = value.quantize(Decimal("0.01"))
+    q = abs(q) if q == 0 else q
     if field == "return_pct":
-        return f"{value.quantize(Decimal('0.01'))}%"
-    return f"{value.quantize(Decimal('0.01'))} USDT"
+        return f"{q:,.2f}%"
+    return f"{q:,.2f} USDT"
 
 
 def check(text: str, figures: dict):

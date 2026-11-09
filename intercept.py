@@ -78,10 +78,12 @@ class Guard:
     settings():          {"paper_mode": bool, "intercept_tool": str, "intercept_args": mapping}
     get_ledger():        the Ledger
     note_session(sid):   records that this session used attest (for the claim check)
+    present(result):     display rounding for the result shown to the model
     """
 
-    def __init__(self, settings, get_ledger, note_session=lambda sid: None):
+    def __init__(self, settings, get_ledger, note_session=lambda sid: None, present=lambda r: r):
         self.settings, self.get_ledger, self.note_session = settings, get_ledger, note_session
+        self.present = present
 
     def __call__(self, tool_name=None, args=None, **kwargs):
         try:
@@ -108,7 +110,10 @@ class Guard:
                           f"paper order ({exc}). Nothing was sent to {tool_name} and no paper order was placed. "
                           "Check intercept_args in attest's settings.")
         session_id = kwargs.get("session_id")
-        self.note_session(session_id)
+        try:
+            self.note_session(session_id)
+        except Exception:
+            pass  # only feeds the claim check; never decides the order
         result = self.get_ledger().place_order(mapped, session_id=session_id)
         head = LABEL.format(tool=tool_name)
         if result.get("ok") and result.get("duplicate"):
@@ -117,7 +122,11 @@ class Guard:
             head += " Paper fill recorded on the attest ledger."
         else:
             head += f" The paper broker rejected it: {result.get('reason') or result.get('error')}"
-        return _block(f"{head} Result: {json.dumps(result, default=str)}")
+        try:
+            shown = self.present(result)
+        except Exception:
+            shown = result
+        return _block(f"{head} Result: {json.dumps(shown, default=str)}")
 
 
 DEMO_STUB_SCHEMA = {

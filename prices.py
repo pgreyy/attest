@@ -289,6 +289,45 @@ class BinanceSource(HttpSource):
         return parse_binance(symbol, status, payload, fetched_at)
 
 
+DEMO_STALE_SECONDS = 60.0
+
+
+class DemoSource:
+    """Wraps one source for the demo_feed setting, only for showing rejections in a chat.
+      off   -> the wrapped source, unchanged
+      stale -> the wrapped source's real quote with its times moved 60 s into the past
+      down  -> fails at once, without touching the network
+    mode() is read on every call."""
+
+    def __init__(self, inner, mode):
+        self.inner, self.mode = inner, mode
+
+    @property
+    def name(self):
+        m = self._mode()
+        base = getattr(self.inner, "name", "source")
+        return base if m == "off" else f"{base} (DEMO FEED {m})"
+
+    def _mode(self) -> str:
+        try:
+            m = str(self.mode() or "off").strip().lower()
+        except Exception:
+            return "off"
+        return m if m in ("stale", "down") else "off"
+
+    def quote(self, symbol: str) -> Quote:
+        m = self._mode()
+        if m == "down":
+            raise PriceError("feed_unavailable",
+                             f"{getattr(self.inner, 'name', 'source')} is switched off by the demo_feed setting "
+                             "(DEMO FEED down).")
+        q = self.inner.quote(symbol)
+        if m == "stale":
+            return replace(q, fetched_at=q.fetched_at - DEMO_STALE_SECONDS,
+                           quote_time=None if q.quote_time is None else q.quote_time - DEMO_STALE_SECONDS)
+        return q
+
+
 class FallbackSource:
     """Tries each source in order and returns the first fresh, sane quote."""
 

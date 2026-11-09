@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 # logs
 *.log
+# planning notes, kept out of git
+attest-build-plan.md

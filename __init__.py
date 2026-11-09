@@ -15,9 +15,9 @@ import time
 from decimal import Decimal
 from pathlib import Path
 
-from . import claims, commands, intercept, tools
+from . import claims, commands, display, intercept, tools
 from .ledger import DEFAULT_POLICY, DEFAULT_STARTING_BALANCE, Ledger
-from .prices import BinanceSource, FallbackSource, KrakenSource, OkxSource
+from .prices import BinanceSource, DemoSource, FallbackSource, KrakenSource, OkxSource
 
 DB_NAME = "attest.db"
 
@@ -32,14 +32,18 @@ _LEDGER = None
 _LOCK = threading.Lock()
 DB_PATH = None
 
-# Sessions that called an attest tool; the claim check runs only in these.
+# Sessions that called an attest tool; the claim check runs only in these. Kept in
+# the ledger db (attest_sessions) so a gateway restart doesn't forget them; this
+# set only saves repeat writes within one process.
 _SESSIONS = set()
 _SESSIONS_MAX = 2000
 
 # Paper mode settings, re-read at most every SETTINGS_TTL seconds (pre_tool_call
 # runs on every tool call). The last good read is kept if a read fails.
 SETTINGS_TTL = 5.0
-_SETTINGS = {"at": -1e18, "value": {"paper_mode": True, "intercept_tool": "", "intercept_args": {}}}
+_SETTINGS = {"at": -1e18, "value": {"paper_mode": True, "intercept_tool": "", "intercept_args": {},
+                                     "demo_feed": "off"}}
+DEMO_FEED_MODES = ("off", "stale", "down")
 
 
 def _number(key, default, low=None, high=None) -> Decimal:
@@ -78,20 +82,36 @@ def paper_settings() -> dict:
     try:
         tool = _CTX.get_config("intercept_tool", "") if _CTX is not None else ""
         mapping = _CTX.get_config("intercept_args", {}) if _CTX is not None else {}
+        demo = _CTX.get_config("demo_feed", "off") if _CTX is not None else "off"
+        demo = str(demo or "off").strip().lower()
         _SETTINGS["value"] = {"paper_mode": _flag("paper_mode", True),
                               "intercept_tool": tool.strip() if isinstance(tool, str) else "",
-                              "intercept_args": mapping if mapping is not None else {}}
+                              "intercept_args": mapping if mapping is not None else {},
+                              "demo_feed": demo if demo in DEMO_FEED_MODES else "off"}
         _SETTINGS["at"] = now
     except Exception:
         pass  # keep the last good settings
     return _SETTINGS["value"]
 
 
+def demo_mode() -> str:
+    return paper_settings().get("demo_feed", "off")
+
+
 def note_session(session_id) -> None:
-    if session_id:
-        if len(_SESSIONS) >= _SESSIONS_MAX:
-            _SESSIONS.clear()
-        _SESSIONS.add(str(session_id))
+    """Remember that this session used attest, in memory and in the ledger db."""
+    if not session_id or str(session_id) in _SESSIONS:
+        return
+    get_ledger().note_session(session_id)
+    if len(_SESSIONS) >= _SESSIONS_MAX:
+        _SESSIONS.clear()
+    _SESSIONS.add(str(session_id))
+
+
+def session_used(session_id) -> bool:
+    if not session_id:
+        return False
+    return str(session_id) in _SESSIONS or get_ledger().session_used(session_id)
 
 
 def _data_dir() -> Path:
@@ -107,7 +127,8 @@ def get_ledger() -> Ledger:
         with _LOCK:
             if _LEDGER is None:
                 DB_PATH = _data_dir() / DB_NAME
-                feed = FallbackSource([OkxSource(), KrakenSource(), BinanceSource()],
+                feed = FallbackSource([DemoSource(src, demo_mode) for src in (OkxSource(), KrakenSource(),
+                                                                              BinanceSource())],
                                       max_age=lambda: float(_policy()["max_quote_age_seconds"]))
                 _LEDGER = Ledger(DB_PATH, _starting_balance(), prices=feed, policy=_policy)
     return _LEDGER
@@ -119,10 +140,10 @@ def on_transform_llm_output(response_text=None, session_id=None, **kwargs):
     try:
         if not isinstance(response_text, str) or not response_text.strip():
             return None
-        if not session_id or str(session_id) not in _SESSIONS:
-            return None
         if not claims.find_claims(response_text):
             return None  # nothing groundable: don't even read the ledger
+        if not session_used(session_id):
+            return None
         note = claims.check(response_text, get_ledger().figures())
         if not note:
             return None
@@ -131,7 +152,7 @@ def on_transform_llm_output(response_text=None, session_id=None, **kwargs):
         return None
 
 
-GUARD = intercept.Guard(paper_settings, lambda: get_ledger(), note_session)
+GUARD = intercept.Guard(paper_settings, lambda: get_ledger(), note_session, display.round_result)
 
 
 def register(ctx):
@@ -151,6 +172,6 @@ def register(ctx):
     ctx.register_command(
         "attest",
         commands.make_handler(get_ledger, _starting_balance, paper_settings),
-        description="attest: paper trading ledger status, kill switch resume, reset",
-        args_hint="status | resume | reset [amount]",
+        description="attest: paper trading ledger status, self-check, kill switch resume, reset",
+        args_hint="status | check | resume | reset [amount]",
     )

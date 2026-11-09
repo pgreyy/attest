@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 
+from .display import round_result
 from .ledger import SOURCE, now_iso
 
 TOOLSET = "attest"
@@ -100,8 +101,11 @@ GET_PNL_SCHEMA = {
 def _safe(fn, note_session=lambda sid: None):
     def handler(args=None, **kwargs):
         try:
-            note_session(kwargs.get("session_id"))
-            return json.dumps(fn(args if isinstance(args, dict) else {}, kwargs), default=str)
+            try:
+                note_session(kwargs.get("session_id"))
+            except Exception:
+                pass  # recording the session must never stop the tool
+            return json.dumps(round_result(fn(args if isinstance(args, dict) else {}, kwargs)), default=str)
         except Exception as exc:
             return json.dumps({"ok": False, "error": f"{exc.__class__.__name__}: {exc}",
                                "source": SOURCE, "as_of": now_iso(),
