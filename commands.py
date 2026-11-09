@@ -22,8 +22,10 @@ def _status(ledger) -> str:
         lines.append("  positions:")
         for pos in p["positions"]:
             lines.append(f"    {pos['symbol']}: {pos['quantity']} @ avg {pos['avg_cost']}, "
-                         f"mark {pos['mark_price']}, value {pos['market_value']}, "
+                         f"mark {pos['mark_price']} ({pos['mark_source']}), value {pos['market_value']}, "
                          f"unrealized {pos['unrealized_pnl']}")
+            if not pos.get("mark_is_live", True):
+                lines.append(f"      {pos.get('stale_reason', '')}")
     else:
         lines.append("  positions:      none")
     lines += [

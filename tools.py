@@ -27,17 +27,20 @@ PAPER_ORDER_SCHEMA = {
         "(simulated money, nothing real is traded). Use it whenever the user wants to buy, sell, "
         "trade, invest in, open or close a position in crypto such as BTC or ETH. The result is the "
         "ledger's record of the fill or the reason it was rejected; report it as returned. "
-        "Right now orders must be limit orders with a limit_price; they fill at that price."
+        "Orders fill at the live market price (buy at the ask, sell at the bid) plus slippage and a fee. "
+        "A limit order fills only if the market is already at or better than the limit; otherwise it is "
+        "rejected, because there are no resting orders. If the live price is unavailable the order is "
+        "rejected; never make up a price or a fill."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "symbol": {"type": "string", "description": "Crypto pair, for example BTCUSDT or ETHUSDT"},
+            "symbol": {"type": "string", "description": "Coin or pair, for example BTC, ETH or BTCUSDT"},
             "side": {"type": "string", "enum": ["buy", "sell"]},
             "quantity": {"type": "number", "description": "How many coins, for example 0.01 BTC"},
             "order_type": {"type": "string", "enum": ["market", "limit"],
-                           "description": "limit (works now) or market (needs the live price feed, not yet available)"},
-            "limit_price": {"type": "number", "description": "Price per coin in USDT; required for limit orders"},
+                           "description": "market (default) fills now at the live price; limit fills now only if marketable"},
+            "limit_price": {"type": "number", "description": "Price per coin in USDT, for limit orders only"},
             "note": {"type": "string", "description": "Optional reason for the trade"},
             "client_order_id": {"type": "string",
                                 "description": "Optional unique id for this order; reusing one never places a second trade"},

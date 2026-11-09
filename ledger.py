@@ -10,24 +10,37 @@ kept as a total cost basis so a full close leaves no rounding residue:
 
 So realized + unrealized always equals equity - starting balance exactly.
 
-This module has no Hermes imports, so scripts/ledger_check.py can run it
-against a throwaway database.
+Phase 2 broker: every fill is priced from a live quote (best bid and ask).
+    market buy  -> ask * (1 + slippage)     market sell -> bid * (1 - slippage)
+    limit       -> fills only if marketable now (buy limit >= ask, sell limit
+                   <= bid), at the same market price plus slippage; otherwise
+                   rejected, because attest holds no resting orders.
+    fee         -> notional * fee_bps / 10000
+A quote older than max_quote_age_seconds is never used. If there is no fresh
+quote the order is rejected; there is no fallback price.
+
+This module has no Hermes imports and no network code; the price source is
+passed in, so scripts/ledger_check.py can run it with a fake one.
 """
 from __future__ import annotations
 
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CURRENCY = "USDT"
 DEFAULT_STARTING_BALANCE = Decimal("10000")
+DEFAULT_POLICY = {"fee_bps": 10, "slippage_bps": 5, "max_quote_age_seconds": 10}
 SOURCE = "attest ledger"
-MARK_NOTE = "mark: last fill, live prices arrive in Phase 2"
-FILL_POLICY = "Phase 1: fills at limit_price, no fee, no slippage. Live prices and fees arrive in Phase 2."
 PREC = 50  # digits of Decimal precision for ledger math
+BPS = Decimal("10000")
+
+# Quote columns added in schema 2. Nullable: Phase 1 trades have no quote.
+_QUOTE_COLUMNS = ("quote_bid", "quote_ask", "quote_fetched_at", "price_source", "slippage_bps")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -42,16 +55,21 @@ CREATE TABLE IF NOT EXISTS account (
     created_at       TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trades (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_order_id TEXT UNIQUE,
-    symbol          TEXT NOT NULL,
-    side            TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
-    qty             TEXT NOT NULL,
-    price           TEXT NOT NULL,
-    fee             TEXT NOT NULL,
-    realized_pnl    TEXT NOT NULL,
-    timestamp       TEXT NOT NULL,
-    note            TEXT
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_order_id  TEXT UNIQUE,
+    symbol           TEXT NOT NULL,
+    side             TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+    qty              TEXT NOT NULL,
+    price            TEXT NOT NULL,
+    fee              TEXT NOT NULL,
+    realized_pnl     TEXT NOT NULL,
+    timestamp        TEXT NOT NULL,
+    note             TEXT,
+    quote_bid        TEXT,
+    quote_ask        TEXT,
+    quote_fetched_at TEXT,
+    price_source     TEXT,
+    slippage_bps     TEXT
 );
 CREATE TABLE IF NOT EXISTS positions (
     symbol     TEXT PRIMARY KEY,
@@ -63,6 +81,8 @@ CREATE TABLE IF NOT EXISTS positions (
 """
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
+# Pairs quoted in something other than USDT can't be settled against USDT cash.
+_OTHER_QUOTES = ("USDC", "FDUSD", "BUSD", "TUSD", "DAI", "BTC", "ETH", "BNB", "EUR", "TRY", "BRL", "JPY")
 _MAX_NOTE = 500
 _MAX_COID = 64
 
@@ -79,6 +99,10 @@ class Rejected(Exception):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def ts_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def to_decimal(value, field: str) -> Decimal:
@@ -115,27 +139,57 @@ def fmt(d: Decimal) -> str:
 
 
 def normalize_symbol(raw) -> str:
+    """'btc/usdt', 'BTC-USDT', 'BTCUSD', 'btc' -> 'BTCUSDT'. USDT pairs only."""
     if not isinstance(raw, str) or not raw.strip():
-        raise Rejected("missing_symbol", "symbol is required, for example BTCUSDT.")
+        raise Rejected("missing_symbol", "symbol is required, for example BTC or BTCUSDT.")
     sym = re.sub(r"[\s/_-]", "", raw).upper()
     if not _SYMBOL_RE.match(sym):
-        raise Rejected("invalid_symbol", f"symbol {raw!r} is not a valid pair, use something like BTCUSDT.")
-    return sym
+        raise Rejected("invalid_symbol", f"symbol {raw!r} is not valid, use something like BTC or BTCUSDT.")
+    if sym.endswith("USDT") and len(sym) > 4:
+        return sym
+    if sym.endswith("USD") and len(sym) > 3:
+        return sym + "T"
+    for q in _OTHER_QUOTES:
+        if sym.endswith(q) and len(sym) > len(q) + 1:
+            raise Rejected("unsupported_pair",
+                           f"{sym} is quoted in {q}; the paper account holds {CURRENCY}, so only "
+                           f"{CURRENCY} pairs are supported (for example {sym[:-len(q)]}USDT).")
+    return sym + "USDT"  # a bare base asset such as BTC or ETH
+
+
+def _quote_view(q, age) -> dict:
+    return {"bid": fmt(q.bid), "ask": fmt(q.ask), "fetched_at": ts_iso(q.fetched_at),
+            "age_seconds": float(round(age, 3)), "source": q.source}
 
 
 class Ledger:
     """Opens a fresh connection per operation, so it is safe across threads and
-    a gateway restart simply means the next call reads the same file."""
+    a gateway restart simply means the next call reads the same file.
 
-    def __init__(self, path, starting_balance=DEFAULT_STARTING_BALANCE):
+    prices: an object with quote(symbol) -> prices.Quote, raising prices.PriceError.
+    policy: a dict, or a callable returning one, with fee_bps, slippage_bps,
+            max_quote_age_seconds (read on every order, so config edits apply).
+    clock:  returns unix seconds; tests pass a fake one.
+    """
+
+    def __init__(self, path, starting_balance=DEFAULT_STARTING_BALANCE, prices=None, policy=None,
+                 clock=time.time):
         self.path = Path(path)
         self.default_start = Decimal(starting_balance)
+        self.prices = prices
+        self._policy = policy if policy is not None else dict(DEFAULT_POLICY)
+        self.clock = clock
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as con:
             con.executescript(_SCHEMA)
-            con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
-                        (str(SCHEMA_VERSION),))
-            self._ensure_account(con)
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                self._migrate(con)
+                self._ensure_account(con)
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
 
     # -- plumbing ---------------------------------------------------------
 
@@ -147,6 +201,16 @@ class Ledger:
         con.execute("PRAGMA foreign_keys=ON")
         return _Closing(con)
 
+    @staticmethod
+    def _migrate(con) -> None:
+        """Schema 1 -> 2: add the nullable quote columns to trades. Nothing else changes."""
+        have = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
+        for col in _QUOTE_COLUMNS:
+            if col not in have:
+                con.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT")
+        con.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
+
     def _ensure_account(self, con, balance: Decimal | None = None) -> None:
         if con.execute("SELECT 1 FROM account WHERE id = 1").fetchone() is None:
             start = self.default_start if balance is None else balance
@@ -157,12 +221,22 @@ class Ledger:
     def _account(con) -> sqlite3.Row:
         return con.execute("SELECT * FROM account WHERE id = 1").fetchone()
 
+    def policy(self) -> dict:
+        raw = self._policy() if callable(self._policy) else self._policy
+        out = {}
+        for key, default in DEFAULT_POLICY.items():
+            try:
+                out[key] = Decimal(str(raw.get(key, default)))
+            except Exception:
+                out[key] = Decimal(default)
+        return out
+
     # -- orders -----------------------------------------------------------
 
     def place_order(self, args) -> dict:
-        """Validate and fill one order. Returns a structured dict; a refused
+        """Validate, price and fill one order. Returns a structured dict; a refused
         order comes back as {"ok": False, "status": "rejected", ...}, never raises
-        for bad input."""
+        for bad input or a bad feed."""
         try:
             return self._place(args)
         except Rejected as r:
@@ -185,13 +259,11 @@ class Ledger:
         order_type = str(args.get("order_type") or ("limit" if has_price else "market")).strip().lower()
         if order_type not in ("market", "limit"):
             raise Rejected("invalid_order_type", f"order_type must be 'market' or 'limit', got {order_type!r}.")
-        if order_type == "market":
-            raise Rejected("market_not_available",
-                           "Market orders need a live price. The price feed arrives in Phase 2; "
-                           "for now place a limit order with a limit_price.")
-        price = to_decimal(args.get("limit_price"), "limit_price")
-        if price <= 0:
-            raise Rejected("invalid_limit_price", f"limit_price must be greater than 0, got {fmt(price)}.")
+        limit = None
+        if order_type == "limit":
+            limit = to_decimal(args.get("limit_price"), "limit_price")
+            if limit <= 0:
+                raise Rejected("invalid_limit_price", f"limit_price must be greater than 0, got {fmt(limit)}.")
         note = args.get("note")
         note = str(note)[:_MAX_NOTE] if note not in (None, "") else None
         coid = args.get("client_order_id")
@@ -202,45 +274,89 @@ class Ledger:
             if not coid or len(coid) > _MAX_COID:
                 raise Rejected("invalid_client_order_id",
                                f"client_order_id must be 1 to {_MAX_COID} characters.")
-        return {"side": side, "symbol": symbol, "qty": qty, "price": price,
+        return {"side": side, "symbol": symbol, "qty": qty, "limit": limit,
                 "order_type": order_type, "note": note, "coid": coid}
+
+    @staticmethod
+    def _check_duplicate(con, coid) -> None:
+        if coid is None:
+            return
+        dup = con.execute("SELECT id FROM trades WHERE client_order_id = ?", (coid,)).fetchone()
+        if dup is not None:
+            raise Rejected("duplicate_client_order_id",
+                           f"client_order_id {coid!r} was already used by trade {dup['id']}; "
+                           "nothing new was placed.", existing_trade_id=dup["id"])
+
+    def _quote(self, symbol: str, max_age: Decimal):
+        """A fresh quote and its age in seconds, or Rejected. Never a fallback price."""
+        if self.prices is None:
+            raise Rejected("feed_unavailable", "no price feed is configured, so nothing can be filled.")
+        try:
+            q = self.prices.quote(symbol)
+        except Exception as exc:
+            code = getattr(exc, "code", "feed_unavailable")
+            reason = getattr(exc, "reason", None) or f"{exc.__class__.__name__}: {exc}"
+            if code not in ("unknown_symbol", "bad_quote"):
+                code = "feed_unavailable"
+            raise Rejected(code, f"{reason} The order was not filled; attest never fills at a guessed price.")
+        age = Decimal(str(self.clock())) - Decimal(str(q.fetched_at))
+        if age > max_age or age < -1:
+            raise Rejected("stale_quote",
+                           f"the latest {symbol} quote is {fmt(age.quantize(Decimal('0.001')))} seconds old, "
+                           f"over the {fmt(max_age)} second limit. The order was not filled.",
+                           quote=_quote_view(q, float(age)))
+        return q, age
 
     def _place(self, args) -> dict:
         o = self._parse(args)
-        fee = Decimal("0")  # Phase 2 sets the fee policy
+        pol = self.policy()
+        with self._connect() as con:  # fail fast on a reused id, before touching the network
+            self._check_duplicate(con, o["coid"])
+        q, age = self._quote(o["symbol"], pol["max_quote_age_seconds"])
         with localcontext() as ctx, self._connect() as con:
             ctx.prec = PREC
             con.execute("BEGIN IMMEDIATE")
             try:
-                result = self._fill(con, o, fee)
+                result = self._fill(con, o, q, age, pol)
                 con.execute("COMMIT")
                 return result
             except BaseException:
                 con.execute("ROLLBACK")
                 raise
 
-    def _fill(self, con, o, fee) -> dict:
-        if o["coid"] is not None:
-            dup = con.execute("SELECT id FROM trades WHERE client_order_id = ?", (o["coid"],)).fetchone()
-            if dup is not None:
-                raise Rejected("duplicate_client_order_id",
-                               f"client_order_id {o['coid']!r} was already used by trade {dup['id']}; "
-                               "nothing new was placed.", existing_trade_id=dup["id"])
+    def _fill(self, con, o, q, age, pol) -> dict:
+        self._check_duplicate(con, o["coid"])
+        quote = _quote_view(q, float(age))
+        sym, qty, side, limit = o["symbol"], o["qty"], o["side"], o["limit"]
+        slip, fee_rate = pol["slippage_bps"] / BPS, pol["fee_bps"] / BPS
+        if side == "buy":
+            if limit is not None and limit < q.ask:
+                raise Rejected("not_marketable",
+                               f"buy limit {fmt(limit)} is below the current ask {fmt(q.ask)}. attest does "
+                               "not hold resting orders, so the order was not placed.", quote=quote)
+            price = q.ask * (1 + slip)
+        else:
+            if limit is not None and limit > q.bid:
+                raise Rejected("not_marketable",
+                               f"sell limit {fmt(limit)} is above the current bid {fmt(q.bid)}. attest does "
+                               "not hold resting orders, so the order was not placed.", quote=quote)
+            price = q.bid * (1 - slip)
+        notional = qty * price
+        fee = notional * fee_rate
+
         acct = self._account(con)
         cash = Decimal(acct["cash"])
-        sym, qty, price = o["symbol"], o["qty"], o["price"]
-        notional = qty * price
         pos = con.execute("SELECT * FROM positions WHERE symbol = ?", (sym,)).fetchone()
         held = Decimal(pos["qty"]) if pos else Decimal("0")
         basis = Decimal(pos["cost_basis"]) if pos else Decimal("0")
         ts = now_iso()
 
-        if o["side"] == "buy":
+        if side == "buy":
             cost = notional + fee
             if cost > cash:
                 raise Rejected("insufficient_cash",
-                               f"buy needs {fmt(cost)} {CURRENCY} but only {fmt(cash)} {CURRENCY} is available.",
-                               needed=fmt(cost), available=fmt(cash))
+                               f"buy needs {fmt(cost)} {CURRENCY} including fee but only {fmt(cash)} "
+                               f"{CURRENCY} is available.", needed=fmt(cost), available=fmt(cash), quote=quote)
             cash -= cost
             held += qty
             basis += cost
@@ -259,9 +375,11 @@ class Ledger:
 
         con.execute("UPDATE account SET cash = ? WHERE id = 1", (str(cash),))
         cur = con.execute(
-            "INSERT INTO trades (client_order_id, symbol, side, qty, price, fee, realized_pnl, timestamp, note) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (o["coid"], sym, o["side"], str(qty), str(price), str(fee), str(realized), ts, o["note"]))
+            "INSERT INTO trades (client_order_id, symbol, side, qty, price, fee, realized_pnl, timestamp, note, "
+            "quote_bid, quote_ask, quote_fetched_at, price_source, slippage_bps) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (o["coid"], sym, side, str(qty), str(price), str(fee), str(realized), ts, o["note"],
+             str(q.bid), str(q.ask), quote["fetched_at"], q.source, str(pol["slippage_bps"])))
         if held == 0:
             con.execute("DELETE FROM positions WHERE symbol = ?", (sym,))
         else:
@@ -270,60 +388,101 @@ class Ledger:
                         "cost_basis = excluded.cost_basis, last_price = excluded.last_price, "
                         "updated_at = excluded.updated_at",
                         (sym, str(held), str(basis), str(price), ts))
-        trade = {"id": cur.lastrowid, "client_order_id": o["coid"], "symbol": sym, "side": o["side"],
-                 "quantity": fmt(qty), "price": fmt(price), "notional": fmt(notional), "fee": fmt(fee),
-                 "timestamp": ts, "note": o["note"]}
-        if o["side"] == "sell":
+        trade = {"id": cur.lastrowid, "client_order_id": o["coid"], "symbol": sym, "side": side,
+                 "order_type": o["order_type"], "quantity": fmt(qty), "price": fmt(price),
+                 "notional": fmt(notional), "fee": fmt(fee), "fee_bps": fmt(pol["fee_bps"]),
+                 "slippage_bps": fmt(pol["slippage_bps"]), "quote": quote, "timestamp": ts, "note": o["note"]}
+        if limit is not None:
+            trade["limit_price"] = fmt(limit)
+        if side == "sell":
             trade["realized_pnl"] = fmt(realized)
         return {
             "ok": True, "status": "filled", "trade": trade,
             "cash_after": fmt(cash), "currency": CURRENCY,
             "position_after": {"symbol": sym, "quantity": fmt(held),
                                "avg_cost": fmt(basis / held) if held else "0"},
-            "fill_policy": FILL_POLICY, "source": SOURCE, "as_of": ts,
+            "fill_policy": self.fill_policy(pol), "source": SOURCE, "as_of": ts,
         }
+
+    @staticmethod
+    def fill_policy(pol) -> str:
+        return (f"Filled from the live quote: buys at ask, sells at bid, plus {fmt(pol['slippage_bps'])} bps "
+                f"slippage against the trader, and a {fmt(pol['fee_bps'])} bps fee. Limit orders fill only "
+                "when marketable now, at that same price (not at the limit); attest holds no resting orders.")
 
     # -- reporting --------------------------------------------------------
 
-    def _snapshot(self, con) -> dict:
-        acct = self._account(con)
+    def _read(self):
+        with self._connect() as con:
+            acct = self._account(con)
+            rows = con.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
+            t = con.execute("SELECT COUNT(*) AS n, "
+                            "SUM(CASE WHEN side = 'buy' THEN 1 ELSE 0 END) AS buys, "
+                            "SUM(CASE WHEN side = 'sell' THEN 1 ELSE 0 END) AS sells FROM trades").fetchone()
+            pnl_rows = con.execute("SELECT realized_pnl, fee FROM trades").fetchall()
+        return acct, rows, t, pnl_rows
+
+    def _mark(self, symbol: str, last_fill: Decimal, max_age: Decimal) -> dict:
+        """Live bid if a fresh quote is available, else the last fill price labelled stale."""
+        try:
+            q, age = self._quote(symbol, max_age)
+            return {"price": q.bid, "live": True, "source": "live bid",
+                    "quote_fetched_at": ts_iso(q.fetched_at), "quote_source": q.source}
+        except Rejected as r:
+            return {"price": last_fill, "live": False, "source": "last fill (STALE)",
+                    "stale_reason": r.reason.split(" The order")[0]}
+
+    def _snapshot(self) -> dict:
+        acct, rows, t, pnl_rows = self._read()
+        max_age = self.policy()["max_quote_age_seconds"]
         cash = Decimal(acct["cash"])
         start = Decimal(acct["starting_balance"])
-        rows = con.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
-        positions, value, basis_total = [], Decimal("0"), Decimal("0")
+        positions, value, basis_total, stale = [], Decimal("0"), Decimal("0"), []
         for r in rows:
-            qty, basis, mark = Decimal(r["qty"]), Decimal(r["cost_basis"]), Decimal(r["last_price"])
-            mv = qty * mark
+            qty, basis = Decimal(r["qty"]), Decimal(r["cost_basis"])
+            m = self._mark(r["symbol"], Decimal(r["last_price"]), max_age)
+            mv = qty * m["price"]
             value += mv
             basis_total += basis
-            positions.append({"symbol": r["symbol"], "quantity": fmt(qty), "avg_cost": fmt(basis / qty),
-                              "mark_price": fmt(mark), "mark_source": "last fill",
-                              "market_value": fmt(mv), "unrealized_pnl": fmt(mv - basis)})
-        t = con.execute("SELECT COUNT(*) AS n, "
-                        "SUM(CASE WHEN side = 'buy' THEN 1 ELSE 0 END) AS buys, "
-                        "SUM(CASE WHEN side = 'sell' THEN 1 ELSE 0 END) AS sells FROM trades").fetchone()
-        realized = sum((Decimal(r[0]) for r in con.execute("SELECT realized_pnl FROM trades")), Decimal("0"))
-        fees = sum((Decimal(r[0]) for r in con.execute("SELECT fee FROM trades")), Decimal("0"))
+            p = {"symbol": r["symbol"], "quantity": fmt(qty), "avg_cost": fmt(basis / qty),
+                 "mark_price": fmt(m["price"]), "mark_source": m["source"], "mark_is_live": m["live"],
+                 "market_value": fmt(mv), "unrealized_pnl": fmt(mv - basis)}
+            if m["live"]:
+                p["mark_quote_fetched_at"] = m["quote_fetched_at"]
+            else:
+                p["stale_reason"] = m["stale_reason"]
+                stale.append(r["symbol"])
+            positions.append(p)
+        realized = sum((Decimal(r["realized_pnl"]) for r in pnl_rows), Decimal("0"))
+        fees = sum((Decimal(r["fee"]) for r in pnl_rows), Decimal("0"))
+        if not positions:
+            note = "no open positions, nothing to mark"
+        elif stale:
+            note = (f"STALE MARKS: {', '.join(stale)} could not get a live quote and "
+                    f"{'is' if len(stale) == 1 else 'are'} marked at the last fill price. Unrealized P&L "
+                    "and equity are NOT live; say so when reporting them.")
+        else:
+            note = "marks: live Binance bid"
         return {"acct": acct, "cash": cash, "start": start, "positions": positions, "value": value,
-                "basis": basis_total, "realized": realized, "fees": fees,
-                "trades": t["n"] or 0, "buys": t["buys"] or 0, "sells": t["sells"] or 0}
+                "basis": basis_total, "realized": realized, "fees": fees, "marks_live": not stale,
+                "mark_note": note, "trades": t["n"] or 0, "buys": t["buys"] or 0, "sells": t["sells"] or 0}
 
     def portfolio(self) -> dict:
-        with localcontext() as ctx, self._connect() as con:
+        with localcontext() as ctx:
             ctx.prec = PREC
-            s = self._snapshot(con)
+            s = self._snapshot()
             return {
                 "ok": True, "source": SOURCE, "as_of": now_iso(), "currency": CURRENCY,
                 "cash": fmt(s["cash"]), "positions": s["positions"],
                 "positions_value": fmt(s["value"]), "total_equity": fmt(s["cash"] + s["value"]),
                 "starting_balance": fmt(s["start"]), "account_created": s["acct"]["created_at"],
-                "mark_note": MARK_NOTE,
+                "marks_live": s["marks_live"], "mark_note": s["mark_note"],
             }
 
     def pnl(self) -> dict:
-        with localcontext() as ctx, self._connect() as con:
+        with localcontext() as ctx:
             ctx.prec = PREC
-            s = self._snapshot(con)
+            s = self._snapshot()
             equity = s["cash"] + s["value"]
             unrealized = s["value"] - s["basis"]
             total = s["realized"] + unrealized
@@ -336,7 +495,7 @@ class Ledger:
                 "fees_paid": fmt(s["fees"]),
                 "trade_count": s["trades"], "buys": s["buys"], "sells": s["sells"],
                 "reconciles": total == equity - s["start"],
-                "mark_note": MARK_NOTE,
+                "marks_live": s["marks_live"], "mark_note": s["mark_note"],
             }
 
     # -- admin ------------------------------------------------------------

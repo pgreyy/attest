@@ -1,7 +1,15 @@
 name: attest
-version: 0.1.0
-description: "Paper trading ledger for Hermes agents. Orders, balances and P&L live in a SQLite ledger the plugin owns; the agent gets its figures by calling get_portfolio and get_pnl instead of stating them. Phase 1: limit orders fill at the limit price, no live prices or fees yet."
+version: 0.2.0
+description: "Paper trading ledger for Hermes agents. Orders, balances and P&L live in a SQLite ledger the plugin owns; the agent gets its figures by calling get_portfolio and get_pnl instead of stating them. Orders are priced from live Binance quotes with slippage and a fee; no real money, no account, no key. Network: read-only HTTPS GET to data-api.binance.vision (public market data) when an order is placed or a position is marked. Nothing else leaves the machine."
 requires_hermes: ">=0.23.0"
+# Network disclosure (Hermes has no manifest field for this, so it is stated here and in the description):
+#   host:    data-api.binance.vision (Binance public market data, no key, no account)
+#   request: GET /api/v3/ticker/bookTicker?symbol=<PAIR>, 3 second timeout
+#   when:    on paper_order, and on get_portfolio, get_pnl and /attest status to mark open positions
+#   sends:   only the trading pair, for example BTCUSDT
+tags:
+  - paper-trading
+  - network
 provides_tools:
   - paper_order
   - get_portfolio
@@ -13,3 +21,15 @@ config_schema:
     type: number
     default: 10000
     description: "Starting balance in USDT for a new paper account, and the default for /attest reset."
+  fee_bps:
+    type: number
+    default: 10
+    description: "Fee per fill in basis points of the notional (10 = 0.1%, a taker fee). 0 to 1000."
+  slippage_bps:
+    type: number
+    default: 5
+    description: "Slippage against the trader in basis points (buys above the ask, sells below the bid). 0 to 1000."
+  max_quote_age_seconds:
+    type: number
+    default: 10
+    description: "A quote older than this is stale and is never used to fill or to mark as live. 1 to 300."
