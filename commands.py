@@ -11,7 +11,7 @@ from .ledger import Rejected
 
 USAGE = (
     "Usage:\n"
-    "  /attest status           cash, positions, P&L, risk limits and the kill switch\n"
+    "  /attest status           cash, positions, P&L, risk limits, kill switch, paper mode\n"
     "  /attest resume           clear a tripped daily loss kill switch (today's loss count\n"
     "                           restarts from the next order)\n"
     "  /attest reset [amount]   wipe the paper account and start fresh\n"
@@ -36,7 +36,23 @@ def _risk_lines(risk) -> list:
     return lines
 
 
-def _status(ledger) -> str:
+def _paper_lines(paper_settings) -> list:
+    if paper_settings is None:
+        return []
+    try:
+        s = paper_settings()
+    except Exception as exc:
+        return [f"  paper mode:     unknown (settings unreadable: {exc.__class__.__name__})"]
+    tool = s.get("intercept_tool") or ""
+    if not tool:
+        return [f"  paper mode:     {'on' if s.get('paper_mode', True) else 'off'}; no external order tool "
+                "guarded (attest's own tools only)"]
+    if s.get("paper_mode", True):
+        return [f"  paper mode:     on; guarding {tool}: its calls are simulated on this ledger, never sent"]
+    return [f"  paper mode:     OFF; {tool} runs for real, attest only watches its own tools"]
+
+
+def _status(ledger, paper_settings=None) -> str:
     p, q = ledger.portfolio(), ledger.pnl()
     cur = p["currency"]
     lines = [f"attest paper account (source: {p['source']}, as of {p['as_of']})",
@@ -59,11 +75,12 @@ def _status(ledger) -> str:
         f"  trades:         {q['trade_count']} ({q['buys']} buys, {q['sells']} sells)",
     ]
     lines += _risk_lines(q["risk"])
+    lines += _paper_lines(paper_settings)
     lines.append(f"  {p['mark_note']}")
     return "\n".join(lines)
 
 
-def make_handler(get_ledger, default_balance):
+def make_handler(get_ledger, default_balance, paper_settings=None):
     def handle(raw_args: str = "", **kwargs) -> str:
         try:
             try:
@@ -72,7 +89,7 @@ def make_handler(get_ledger, default_balance):
                 words = (raw_args or "").split()
             sub = words[0].lower() if words else "status"
             if sub == "status":
-                return _status(get_ledger())
+                return _status(get_ledger(), paper_settings)
             if sub == "resume":
                 out = get_ledger().resume()
                 if out["was_tripped"]:

@@ -786,6 +786,219 @@ def idempotency(path, feed, clock):
     assert led.place_order(dict(args), session_id="s1")["ok"], "same order outside the 10 s window"
 
 
+# ---------------------------------------------------------------- Phase 4 and 5 cases
+
+import itertools as _itertools
+import json as _json
+
+_PKG_COUNTER = _itertools.count()
+
+
+class Boom:
+    """A ledger stand-in whose every call fails, to prove fail-closed / fail-open."""
+
+    def place_order(self, *a, **k):
+        raise RuntimeError("simulated ledger failure")
+
+    def figures(self):
+        raise RuntimeError("simulated ledger failure")
+
+
+def plugin_instance(config, ledger):
+    """The real plugin package, freshly loaded and registered against a fake Hermes
+    context, with its ledger replaced by one on a temp db with a fake feed."""
+    import importlib.util
+    name = f"attest_p45_{next(_PKG_COUNTER)}"
+    spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "__init__.py",
+                                                  submodule_search_locations=[str(PLUGIN_DIR)])
+    pkg = importlib.util.module_from_spec(spec)
+    sys.modules[name] = pkg
+    spec.loader.exec_module(pkg)
+    reg = SimpleNamespace(tools={}, hooks={}, commands={}, stub_runs=[])
+
+    def get_config(key, default=None):
+        if config.get("_broken"):
+            raise RuntimeError("config unreadable")
+        return config.get(key, default)
+    ctx = SimpleNamespace(get_config=get_config, state=SimpleNamespace(data_dir=str(Path(tempfile.gettempdir()) / "unused")),
+                          register_tool=lambda **kw: reg.tools.__setitem__(kw["name"], kw),
+                          register_hook=lambda hook, cb, **kw: reg.hooks.__setitem__(hook, cb),
+                          register_command=lambda cmd, h, **kw: reg.commands.__setitem__(cmd, h))
+    pkg.register(ctx)
+    pkg._LEDGER = ledger
+    pkg.SETTINGS_TTL = 0  # see config edits at once
+    if "demo_broker_order" in reg.tools:
+        real = reg.tools["demo_broker_order"]["handler"]
+
+        def counted(args=None, **kw):
+            reg.stub_runs.append(args)
+            return real(args, **kw)
+        reg.tools["demo_broker_order"]["handler"] = counted
+    return pkg, reg
+
+
+def hermes_call(reg, tool, args, session_id="s1"):
+    """What Hermes does with a tool call (agent/tool_executor.py): pre_tool_call first; a
+    block with a non-empty message becomes the result {"error": message} and the tool never runs."""
+    d = reg.hooks["pre_tool_call"](tool_name=tool, args=args, session_id=session_id, task_id="t",
+                                   tool_call_id="c", turn_id="u")
+    if isinstance(d, dict) and d.get("action") == "block" and d.get("message"):
+        return True, _json.loads(_json.dumps({"error": d["message"]}))["error"]
+    return False, _json.loads(reg.tools[tool]["handler"](args, session_id=session_id))
+
+
+GUARDED = {"intercept_tool": "demo_broker_order", "paper_mode": True, "demo_stub_tool": True}
+LABEL_START = "attest paper mode: this order was simulated, nothing was sent to demo_broker_order."
+
+
+@case("intercept: paper mode fills on the ledger and the stub never runs (fills, duplicates, rejections)")
+def intercept_paper(path, feed, clock):
+    led = Ledger(path, D("10000"), prices=feed, policy=LIVE_COSTS, clock=clock)
+    feed.set("BTCUSDT", 59990, 60010)
+    pkg, reg = plugin_instance(dict(GUARDED), led)
+    assert "demo_broker_order" in reg.tools, "stub not registered with demo_stub_tool on"
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 0.001,
+                                                          "client_order_id": "x-1"})
+    assert blocked and not reg.stub_runs, "the stub ran in paper mode"
+    assert msg.startswith(LABEL_START) and "Paper fill recorded" in msg, msg[:200]
+    fill = _json.loads(msg.split(" Result: ", 1)[1])
+    assert fill["ok"] and fill["trade"]["symbol"] == "BTCUSDT", fill
+    eq(fill["trade"]["price"], "60040.005", "intercepted order priced like paper_order")
+    assert led.pnl()["trade_count"] == 1, "fill not on the ledger"
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 0.001,
+                                                          "client_order_id": "x-1"})
+    assert blocked and "already filled" in msg and led.pnl()["trade_count"] == 1, "retry traded again"
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "notional": 5000})
+    assert blocked and msg.startswith(LABEL_START) and "rejected it" in msg and "1000" in msg, msg[:300]
+    assert led.pnl()["trade_count"] == 1 and not reg.stub_runs, "rejected order traded or reached the stub"
+    status = reg.commands["attest"]("status")
+    assert "paper mode:     on; guarding demo_broker_order" in status, status
+
+
+@case("intercept: paper_mode off lets the stub run untouched")
+def intercept_off(path, feed, clock):
+    led = Ledger(path, D("10000"), prices=feed, policy=LIVE_COSTS, clock=clock)
+    feed.set("BTCUSDT", 59990, 60010)
+    pkg, reg = plugin_instance(dict(GUARDED, paper_mode=False), led)
+    before = led.pnl()["trade_count"]
+    blocked, out = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 0.001})
+    assert not blocked and out["real_order_sent"] is True and len(reg.stub_runs) == 1, out
+    assert led.pnl()["trade_count"] == before, "paper mode off still wrote to the ledger"
+    assert "OFF; demo_broker_order runs for real" in reg.commands["attest"]("status"), "status"
+
+
+@case("intercept: mapping errors and internal errors block the guarded tool (fail closed)")
+def intercept_fail_closed(path, feed, clock):
+    led = Ledger(path, D("10000"), prices=feed, policy=LIVE_COSTS, clock=clock)
+    feed.set("BTCUSDT", 59990, 60010)
+    cfg = dict(GUARDED, intercept_args={"symbol": "ticker", "side": "action", "quantity": "order.qty"})
+    pkg, reg = plugin_instance(cfg, led)
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"ticker": "BTC", "action": "buy"})
+    assert blocked and "could not be turned into a paper order" in msg and "order.qty" in msg, msg
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"ticker": "BTC", "action": "buy", "order": {"qty": 0.001}})
+    assert blocked and "Paper fill recorded" in msg, f"custom (nested) mapping did not fill: {msg[:200]}"
+    cfg["intercept_args"] = ["symbol", "side"]
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 1})
+    assert blocked and "intercept_args must map" in msg, msg
+    cfg["intercept_args"] = {"ticker": "symbol"}
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 1})
+    assert blocked and "doesn't know: ticker" in msg, msg
+    cfg["intercept_args"] = {}
+    blocked, msg = hermes_call(reg, "demo_broker_order", "not an object")
+    assert blocked and "not an object" in msg, msg
+    pkg._LEDGER = Boom()
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 0.001})
+    assert blocked and "internal error" in msg and "Nothing was sent" in msg, msg
+    cfg["_broken"] = True  # config unreadable now: the last good settings still guard the tool
+    blocked, msg = hermes_call(reg, "demo_broker_order", {"symbol": "BTC", "side": "buy", "quantity": 0.001})
+    assert blocked, "an unreadable config let the guarded tool through"
+    assert not reg.stub_runs, "the stub ran"
+    assert led.pnl()["trade_count"] == 1, "only the one valid mapped order should be on the ledger"
+
+
+@case("intercept: other tools untouched, own tools never intercepted, stub off by default")
+def intercept_others(path, feed, clock):
+    led = Ledger(path, D("10000"), prices=feed, policy=LIVE_COSTS, clock=clock)
+    cfg = dict(GUARDED)
+    pkg, reg = plugin_instance(cfg, led)
+    hook = reg.hooks["pre_tool_call"]
+    for tool, args in (("terminal", {"command": "ls"}), ("read_file", None), ("web_search", "x"),
+                       ("paper_order", {"symbol": "BTC"}), (None, None)):
+        assert hook(tool_name=tool, args=args, session_id="s") is None, f"{tool} was touched"
+    cfg["intercept_tool"] = "paper_order"  # guarding attest's own tool would run orders twice
+    assert hook(tool_name="paper_order", args={"symbol": "BTC", "side": "buy", "quantity": 1}) is None
+    cfg["intercept_tool"] = ""
+    assert hook(tool_name="demo_broker_order", args={}) is None, "with intercept_tool empty nothing is guarded"
+    cfg["_broken"] = True
+    assert hook(tool_name="terminal", args={"command": "ls"}) is None, "broken config affected another tool"
+    pkg2, reg2 = plugin_instance({}, led)
+    assert "demo_broker_order" not in reg2.tools, "stub registered without demo_stub_tool"
+    assert set(reg2.tools) == {"paper_order", "get_quote", "get_portfolio", "get_pnl"}, sorted(reg2.tools)
+    assert set(reg2.hooks) == {"pre_tool_call", "transform_llm_output"}, sorted(reg2.hooks)
+
+
+def _claim_setup(path, feed, clock):
+    """Cash 9710, equity 10020, realized 10, unrealized 10, total 20, return 0.2%."""
+    led = Ledger(path, D("10000"), prices=feed, policy=NO_COSTS, clock=clock)
+    feed.set("BTCUSDT", 60000, 60000)
+    assert led.place_order({"symbol": "BTC", "side": "buy", "quantity": 0.01})["ok"]
+    feed.set("BTCUSDT", 62000, 62000)
+    assert led.place_order({"symbol": "BTC", "side": "sell", "quantity": 0.005})["ok"]
+    pkg, reg = plugin_instance({}, led)
+    reg.tools["get_pnl"]["handler"]({}, session_id="sess-A")  # this session used attest
+    return led, pkg, reg
+
+
+@case("claim check: flags wrong equity, P&L and return %, appends only, leaves correct figures alone")
+def claim_flags(path, feed, clock):
+    led, pkg, reg = _claim_setup(path, feed, clock)
+    tr = lambda text, sid="sess-A": reg.hooks["transform_llm_output"](
+        response_text=text, session_id=sid, model="m", platform="cli", turn_id="t")
+    for text, note in (
+        ("Your equity is $10,500.", "attest check: the ledger shows equity 10020.00 USDT, not $10,500."),
+        ("Your total P&L is $50.", "attest check: the ledger shows total P&L 20.00 USDT, not $50."),
+        ("That is a return of 1.5% so far.", "attest check: the ledger shows return 0.20%, not 1.5%."),
+        ("Overall you have a loss of $20 on the account.", "attest check: the ledger shows total P&L 20.00 USDT, not -$20."),
+        ("Your balance is $9,000.", "attest check: the ledger shows cash 9710.00 USDT and equity 10020.00 USDT, not $9,000."),
+    ):
+        out = tr(text)
+        assert isinstance(out, str) and out.startswith(text), f"original text changed: {out!r}"
+        assert out[len(text):] == "\n\n" + note, f"for {text!r} got note {out[len(text):]!r}"
+    correct = ("Here are your numbers from the ledger:\n- **Cash:** $9,710.00\n- Equity: 10,020.40 USDT\n"
+               "- Realized P&L: $10\n- Unrealized P&L: +$10.00\n- Return: 0.2%\n- Balance: $10,020")
+    assert tr(correct) is None, f"a correct reply was flagged: {tr(correct)!r}"
+    out = tr("Your equity is $10,500. Your cash is $9,710.")
+    assert out.endswith("\n\nattest check: the ledger shows equity 10020.00 USDT, not $10,500."), out
+
+
+@case("claim check: ignores ungroundable figures and sessions that never called attest; fails open")
+def claim_quiet(path, feed, clock):
+    led, pkg, reg = _claim_setup(path, feed, clock)
+    tr = lambda text, sid="sess-A": reg.hooks["transform_llm_output"](
+        response_text=text, session_id=sid, model="m", platform="cli", turn_id="t")
+    for text in ("BTC is trading at $74,000 right now.",
+                 "Your max daily loss is $500.",
+                 "If BTC rises 10% you would make $31.",
+                 "I bought 0.001 BTC for $74.68.",
+                 "Your starting balance was $10,000.",
+                 "Realized P&L is $99 and unrealized is $99.",  # two figures in one clause: can't tie each
+                 "You have 12 trades and 3 positions.",
+                 ""):
+        assert tr(text) is None, f"flagged an ungroundable figure: {text!r} -> {tr(text)!r}"
+    assert tr("Your equity is $10,500.", sid="sess-B") is None, "checked a session that never called attest"
+    assert tr("Your equity is $10,500.", sid="") is None, "checked a reply with no session"
+    feed.down = True  # marks stale: equity can't be grounded, cash still can
+    try:
+        assert tr("Your equity is $10,500.") is None, "flagged equity with stale marks"
+        out = tr("Your cash is $5,000.")
+        assert out and out.endswith("cash 9710.00 USDT, not $5,000."), out
+    finally:
+        feed.down = False
+    pkg._LEDGER = Boom()
+    assert tr("Your equity is $10,500.") is None, "an internal error changed the reply"
+    assert reg.hooks["transform_llm_output"](response_text=None, session_id="sess-A") is None, "None input"
+
+
 def main():
     groups = (
         ("phase1.db", (arithmetic, restart, oversell, overspend, qty_zero, other_rejects)),
@@ -806,6 +1019,12 @@ def main():
         ("kill.db", (kill_switch, kill_resume)),
         ("kill_next_day.db", (kill_next_day,)),
         ("idempotency.db", (idempotency,)),
+        ("intercept.db", (intercept_paper,)),
+        ("intercept_off.db", (intercept_off,)),
+        ("intercept_fail.db", (intercept_fail_closed,)),
+        ("intercept_others.db", (intercept_others,)),
+        ("claims.db", (claim_flags,)),
+        ("claims_quiet.db", (claim_quiet,)),
     )
     with tempfile.TemporaryDirectory(prefix="attest-check-") as tmp:
         assert ".hermes" not in tmp, "refusing to run against a Hermes folder"

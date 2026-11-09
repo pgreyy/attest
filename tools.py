@@ -97,9 +97,10 @@ GET_PNL_SCHEMA = {
 }
 
 
-def _safe(fn):
+def _safe(fn, note_session=lambda sid: None):
     def handler(args=None, **kwargs):
         try:
+            note_session(kwargs.get("session_id"))
             return json.dumps(fn(args if isinstance(args, dict) else {}, kwargs), default=str)
         except Exception as exc:
             return json.dumps({"ok": False, "error": f"{exc.__class__.__name__}: {exc}",
@@ -109,7 +110,9 @@ def _safe(fn):
     return handler
 
 
-def register(ctx, get_ledger) -> None:
+def register(ctx, get_ledger, note_session=lambda sid: None) -> None:
+    """note_session(session_id) is called on every attest tool call, so the claim
+    check only runs in sessions that used attest."""
     tools = [
         (PAPER_ORDER_SCHEMA, lambda a, kw: get_ledger().place_order(a, session_id=kw.get("session_id"))),
         (GET_QUOTE_SCHEMA, lambda a, kw: get_ledger().get_quote(a.get("symbol"))),
@@ -118,4 +121,4 @@ def register(ctx, get_ledger) -> None:
     ]
     for schema, fn in tools:
         ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema,
-                          handler=_safe(fn), description=schema["description"])
+                          handler=_safe(fn, note_session), description=schema["description"])

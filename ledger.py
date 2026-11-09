@@ -752,6 +752,18 @@ class Ledger:
                 "marks_live": s["marks_live"], "mark_note": s["mark_note"], "risk": risk,
             }
 
+    def figures(self) -> dict:
+        """The headline figures as Decimals, read-only (no risk writes), for the claim check."""
+        with localcontext() as ctx:
+            ctx.prec = PREC
+            s = self._snapshot()
+            equity = s["cash"] + s["value"]
+            unrealized = s["value"] - s["basis"]
+            total = s["realized"] + unrealized
+            ret = total / s["start"] * 100 if s["start"] else Decimal("0")
+            return {"cash": s["cash"], "equity": equity, "realized": s["realized"], "unrealized": unrealized,
+                    "total": total, "return_pct": ret, "marks_live": s["marks_live"]}
+
     # -- admin (human only: reached from /attest, never from a tool) ------
 
     def resume(self) -> dict:
