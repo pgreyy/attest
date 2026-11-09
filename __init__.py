@@ -138,12 +138,13 @@ def on_transform_llm_output(response_text=None, session_id=None, **kwargs):
     """Append one 'attest check' note when the reply states a figure the ledger
     contradicts. Fail open: any problem leaves the reply exactly as it was."""
     try:
+        # First, before the reply is read at all: did this session use attest?
+        if not session_used(session_id):
+            return None
         if not isinstance(response_text, str) or not response_text.strip():
             return None
         if not claims.find_claims(response_text):
-            return None  # nothing groundable: don't even read the ledger
-        if not session_used(session_id):
-            return None
+            return None  # nothing groundable: no need to read the ledger figures
         note = claims.check(response_text, get_ledger().figures())
         if not note:
             return None

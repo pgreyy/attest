@@ -30,7 +30,8 @@ from decimal import Decimal, InvalidOperation
 TIMEOUT_SECONDS = 3
 CACHE_SECONDS = 2.0
 FUTURE_TOLERANCE_SECONDS = 2.0  # a quote time this far ahead of our clock is treated as bad
-_USER_AGENT = "attest-paper-trading/0.3"
+VERSION = "0.6.1"  # keep equal to plugin.yaml; scripts/ledger_check.py checks it
+_USER_AGENT = f"attest-paper-trading/{VERSION}"
 QUOTE_ASSET = "USDT"
 
 

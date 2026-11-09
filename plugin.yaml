@@ -1,5 +1,5 @@
 name: attest
-version: 0.6.0
+version: 0.6.1
 description: "Paper trading ledger for Hermes agents. Orders, balances and P&L live in a SQLite ledger the plugin owns; the agent gets its figures by calling get_portfolio, get_pnl and get_quote instead of stating them. Orders are priced from live public exchange quotes with slippage and a fee, and pass a per-order size limit, a daily loss kill switch and duplicate-order checks first. In paper mode it can also guard one named external order tool, simulating its calls instead of letting them run, and it appends a short note when a reply states a balance or P&L figure the ledger contradicts. No real money, no exchange account, no keys. Network: read-only HTTPS GETs of public ticker data from www.okx.com, then api.kraken.com, then data-api.binance.vision as fallbacks. Nothing else leaves the machine."
 requires_hermes: ">=0.23.0"
 # Network disclosure (Hermes has no manifest field for this, so it is stated here and in the description).

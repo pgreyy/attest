@@ -7,6 +7,7 @@ Prints PASS for a case only when it ran and every assertion held.
 
     python3 scripts/ledger_check.py
 """
+import re
 import sqlite3
 import sys
 import tempfile
@@ -579,8 +580,12 @@ def okx_ts(path, feed, clock):
     assert "okx quote is 30" in out["reason"], out["reason"]
 
 
-@case("parsers: real OKX, Kraken and Binance payload shapes; wrong pair or crossed refused")
+@case("parsers: real OKX, Kraken and Binance payload shapes; wrong pair or crossed refused; User-Agent = version")
 def parsers(path, feed, clock):
+    import prices as _prices
+    yaml_version = re.search(r"^version:\s*(\S+)", (PLUGIN_DIR / "plugin.yaml").read_text(), re.M).group(1)
+    assert _prices._USER_AGENT == f"attest-paper-trading/{yaml_version}", \
+        f"User-Agent {_prices._USER_AGENT!r} does not match plugin.yaml version {yaml_version}"
     assert okx_inst_id("BTCUSDT") == "BTC-USDT" and kraken_pair("BTCUSDT") == "XBTUSDT", "pair mapping"
     assert kraken_pair("ETHUSDT") == "ETHUSDT", "ETH mapping"
     okx = parse_okx("BTCUSDT", 200, {"code": "0", "msg": "", "data": [{"instType": "SPOT", "instId": "BTC-USDT",
@@ -981,7 +986,7 @@ def claim_flags(path, feed, clock):
     assert out.endswith("\n\nattest check: the ledger shows equity 10,020.00 USDT, not $10,500."), out
 
 
-@case("claim check: ignores ungroundable figures and sessions that never called attest; fails open")
+@case("claim check: ignores ungroundable figures; never reads replies in sessions that didn't use attest; fails open")
 def claim_quiet(path, feed, clock):
     led, pkg, reg = _claim_setup(path, feed, clock)
     tr = lambda text, sid="sess-A": reg.hooks["transform_llm_output"](
@@ -996,6 +1001,24 @@ def claim_quiet(path, feed, clock):
                  ""):
         assert tr(text) is None, f"flagged an ungroundable figure: {text!r} -> {tr(text)!r}"
     assert tr("Your equity is $10,500.", sid="sess-B") is None, "checked a session that never called attest"
+    # Never even read: a spy reply records any method call on it, and the scanners are wrapped.
+    reads = []
+
+    class Spy(str):
+        def __getattribute__(self, name):
+            if not name.startswith("__"):
+                reads.append(name)
+            return str.__getattribute__(self, name)
+    real_find, real_check = pkg.claims.find_claims, pkg.claims.check
+    pkg.claims.find_claims = lambda t: reads.append("find_claims") or real_find(t)
+    pkg.claims.check = lambda t, f: reads.append("check") or real_check(t, f)
+    try:
+        assert tr(Spy("Your equity is $10,500."), sid="sess-B") is None
+        assert reads == [], f"a non-attest session's reply was read: {reads}"
+        assert tr(Spy("Your equity is $10,500."), sid="sess-A"), "control: the attest session should be flagged"
+        assert "find_claims" in reads, "control: the spy should see the scan in an attest session"
+    finally:
+        pkg.claims.find_claims, pkg.claims.check = real_find, real_check
     assert tr("Your equity is $10,500.", sid="") is None, "checked a reply with no session"
     feed.down = True  # marks stale: equity can't be grounded, cash still can
     try:
